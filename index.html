@@ -329,6 +329,7 @@
     function resetLocks() {
       game.myLocked = false; game.peerLocked = false;
       game.myWord = ""; game.peerWord = ""; game.wordSent = false;
+      $("word-input").value = "";
     }
     function startGame() {
       game.started = true; game.round = 1; game.history = [];
@@ -357,8 +358,6 @@
       } else {
         $("input-zone").style.display = "block";
         $("locked-badge").style.display = "none";
-        const inp = $("word-input");
-        inp.value = "";
       }
     }
 
