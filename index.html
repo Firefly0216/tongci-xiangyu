@@ -171,12 +171,10 @@
     <!-- 主菜单 -->
     <section id="screen-menu" class="section active">
       <div class="card">
-        <button id="btn-create" class="btn-primary">创建房间</button>
-        <label for="join-code">或输入好友给的房间码</label>
-        <div class="btn-row">
-          <input id="join-code" type="number" inputmode="numeric" placeholder="4 位数字" maxlength="4" style="flex:1;" />
-        </div>
-        <button id="btn-join" class="btn-ghost">加入房间</button>
+        <label for="join-code">和好友先约好同一组 4 位数字</label>
+        <input id="join-code" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="输入 4 位数字" maxlength="4" />
+        <button id="btn-match" class="btn-primary" style="margin-top:10px;">一起进入</button>
+        <p class="hint" style="margin-top:14px;">两个人都输入这组数字并点“一起进入”。先到的人会自动等待，另一个人会自动匹配，不用转发房间码。</p>
         <p class="hint" style="margin-top:14px;">玩法：两人心里各想一个词 → 数到 3 同时“锁定” → 看是否同词。不同就从这两个词继续联想，不能重复说过的词。</p>
       </div>
     </section>
@@ -184,12 +182,11 @@
     <!-- 房间等待 -->
     <section id="screen-lobby" class="section">
       <div class="card">
-        <p style="text-align:center;margin:0;color:var(--sub);font-size:14px;">把房间码发给微信好友，对方点“加入房间”输入即可</p>
+        <p style="text-align:center;margin:0;color:var(--sub);font-size:14px;">你们的共同暗号</p>
         <div class="room-code" id="room-code">----</div>
-        <button id="btn-copy" class="btn-ghost" style="margin-top:6px;">复制房间码</button>
         <div class="status" id="lobby-status"><span class="dot"></span><span id="lobby-status-text">正在连接服务器…</span></div>
-        <button id="btn-start" class="btn-primary" style="margin-top:18px;" disabled>开始游戏</button>
-        <button id="btn-back" class="btn-ghost">返回</button>
+        <button id="btn-retry" class="btn-ghost" style="display:none;">重新匹配</button>
+        <button id="btn-back" class="btn-ghost">换一组数字</button>
       </div>
     </section>
 
@@ -317,6 +314,7 @@
       }
     };
     let peer = null, conn = null, role = null, roomCode = null, amHost = false, connected = false;
+    let matchToken = 0, startScheduled = false;
     let game = { started: false, round: 1, history: [], myLocked: false, peerLocked: false, myWord: "", peerWord: "", wordSent: false };
 
     function send(obj) {
@@ -334,6 +332,8 @@
     function startGame() {
       game.started = true; game.round = 1; game.history = [];
       resetLocks();
+      startScheduled = false;
+      $("btn-retry").style.display = "none";
       show("screen-game");
       renderGame();
     }
@@ -363,22 +363,27 @@
 
     // ---------- 联机 ----------
     function setupConn() {
-      conn.on("open", () => {
+      const activeConn = conn;
+      activeConn.on("open", () => {
+        if (conn !== activeConn) return;
         connected = true;
         if (role === "guest") send({ type: "hello", role: "guest" });
-        setLobbyStatus("好友已加入，可以开始啦", true);
-        $("btn-start").disabled = false;
+        setLobbyStatus("匹配成功，马上开始…", true);
+        $("btn-retry").style.display = "none";
         renderGame();
       });
-      conn.on("data", handleMessage);
-      conn.on("close", () => {
+      activeConn.on("data", (data) => {
+        if (conn === activeConn) handleMessage(data);
+      });
+      activeConn.on("close", () => {
+        if (conn !== activeConn) return;
         connected = false;
-        $("btn-start").disabled = true;
-        setLobbyStatus("连接已断开", false);
+        setLobbyStatus("连接已断开，可以重新匹配", false);
+        $("btn-retry").style.display = "block";
         toast("和好友的连接断开了");
         renderGame();
       });
-      conn.on("error", (err) => {
+      activeConn.on("error", (err) => {
         console.error(err);
         toast("连接出错：" + (err && err.type ? err.type : ""));
       });
@@ -389,9 +394,14 @@
       switch (data.type) {
         case "hello":
           if (amHost) {
-            setLobbyStatus("好友已加入，可以开始啦", true);
-            $("btn-start").disabled = false;
-            send({ type: "state", started: game.started, round: game.round, history: game.history });
+            connected = true;
+            setLobbyStatus("匹配成功，马上开始…", true);
+            $("btn-retry").style.display = "none";
+            if (game.started) {
+              send({ type: "state", started: game.started, round: game.round, history: game.history });
+            } else {
+              scheduleAutoStart();
+            }
           }
           break;
         case "state":
@@ -420,6 +430,23 @@
           startGame();
           break;
       }
+    }
+
+    function scheduleAutoStart() {
+      if (!amHost || startScheduled) return;
+      startScheduled = true;
+      const token = matchToken;
+      setLobbyStatus("匹配成功，马上开始…", true);
+      setTimeout(() => {
+        if (token !== matchToken || !startScheduled || !connected) return;
+        startScheduled = false;
+        if (game.started) {
+          send({ type: "state", started: game.started, round: game.round, history: game.history });
+          return;
+        }
+        send({ type: "start" });
+        startGame();
+      }, 700);
     }
 
     function maybeReveal() {
@@ -460,16 +487,12 @@
       console.error("PeerJS error:", err);
       const t = err && err.type;
       let msg = "网络出了点问题，请重试";
-      if (t === "unavailable-id") msg = "这个房间码刚被占用，请返回重新创建";
-      else if (t === "peer-unavailable") msg = "没有找到这个房间，请确认房间码";
+      if (t === "unavailable-id") msg = "这组数字暂时不可用，请换一组再试";
+      else if (t === "peer-unavailable") msg = "还没找到好友，请确认对方也输入了这组数字";
       else if (t === "network") msg = "网络连接失败，请检查网络";
       else if (t === "server-error") msg = "服务器繁忙，请稍后再试";
       else if (t === "browser-incompatible") msg = "当前浏览器不支持，请换 Chrome / Safari";
-      toast(msg);
-      if (t === "unavailable-id" || t === "peer-unavailable") {
-        try { peer && peer.destroy(); } catch (e) {}
-        show("screen-menu");
-      }
+      showMatchError(msg);
     }
 
     function setLobbyStatus(text, ok) {
@@ -477,38 +500,134 @@
       $("lobby-status").classList.toggle("ok", !!ok);
     }
 
-    function createRoom() {
-      ensureAudio();
-      roomCode = String(Math.floor(1000 + Math.random() * 9000));
-      role = "host"; amHost = true;
-      $("room-code").textContent = roomCode;
-      show("screen-lobby");
-      setLobbyStatus("正在连接服务器…", false);
-      peer = new Peer("tongci-meet-" + roomCode + "-host", PEER_OPTS);
-      peer.on("open", () => {
-        if (role === "host") setLobbyStatus("等待好友加入…", false);
-      });
-      peer.on("connection", (c) => {
-        if (!conn) { conn = c; setupConn(); }
-      });
-      peer.on("error", peerError);
+    function showMatchError(msg) {
+      setLobbyStatus(msg, false);
+      $("btn-retry").style.display = "block";
+      toast(msg);
     }
 
-    function joinRoom() {
+    function closeMatchConnection() {
+      try { conn && conn.close(); } catch (e) {}
+      try { peer && peer.destroy(); } catch (e) {}
+      conn = null;
+      peer = null;
+      connected = false;
+    }
+
+    function randomSuffix() {
+      return Math.random().toString(36).slice(2, 8);
+    }
+
+    function hostPeerId(code) {
+      return "tongci-meet-" + code + "-host";
+    }
+
+    function matchWithCode() {
       ensureAudio();
       const code = $("join-code").value.replace(/\D/g, "");
-      if (!/^\d{4}$/.test(code)) { toast("请输入 4 位数字房间码"); shake("join-code"); return; }
+      if (!/^\d{4}$/.test(code)) {
+        toast("请先和好友约好 4 位数字");
+        shake("join-code");
+        return;
+      }
+      beginMatch(code);
+    }
+
+    function beginMatch(code) {
+      closeMatchConnection();
+      matchToken += 1;
+      const token = matchToken;
       roomCode = code;
-      role = "guest"; amHost = false;
+      startScheduled = false;
+      game = { started: false, round: 1, history: [], myLocked: false, peerLocked: false, myWord: "", peerWord: "", wordSent: false };
       $("room-code").textContent = roomCode;
+      $("btn-retry").style.display = "none";
+      hideOverlay($("win-overlay"));
+      hideOverlay($("reveal-overlay"));
       show("screen-lobby");
-      setLobbyStatus("正在连接房间…", false);
-      peer = new Peer("tongci-meet-" + code + "-guest", PEER_OPTS);
-      peer.on("open", () => {
-        conn = peer.connect("tongci-meet-" + code + "-host", { reliable: true });
+      setLobbyStatus("正在匹配好友…", false);
+      setTimeout(() => {
+        if (token === matchToken) attemptHost(code, token);
+      }, 250);
+    }
+
+    function retryMatch() {
+      if (!roomCode) { backToMenu(); return; }
+      beginMatch(roomCode);
+    }
+
+    function attemptHost(code, token) {
+      if (token !== matchToken) return;
+      role = "host";
+      amHost = true;
+      const p = new Peer(hostPeerId(code), PEER_OPTS);
+      peer = p;
+      p.on("open", () => {
+        if (token !== matchToken) return;
+        setLobbyStatus("等待好友输入同一组数字…", false);
+      });
+      p.on("connection", (c) => {
+        if (token !== matchToken) return;
+        if (!conn) {
+          conn = c;
+          setupConn();
+        } else {
+          try { c.close(); } catch (e) {}
+        }
+      });
+      p.on("error", (err) => {
+        if (token !== matchToken) return;
+        if (err && err.type === "unavailable-id") {
+          try { p.destroy(); } catch (e) {}
+          if (peer === p) peer = null;
+          attemptGuest(code, token, 0);
+        } else {
+          peerError(err);
+        }
+      });
+    }
+
+    function attemptGuest(code, token, tries) {
+      if (token !== matchToken) return;
+      role = "guest";
+      amHost = false;
+      conn = null;
+      setLobbyStatus(tries ? "正在连接好友…" : "已找到暗号，正在加入…", false);
+      const p = new Peer("tongci-meet-" + code + "-guest-" + randomSuffix(), PEER_OPTS);
+      peer = p;
+      p.on("open", () => {
+        if (token !== matchToken) return;
+        conn = p.connect(hostPeerId(code), { reliable: true });
         setupConn();
       });
-      peer.on("error", peerError);
+      p.on("error", (err) => {
+        if (token !== matchToken) return;
+        const type = err && err.type;
+        if (type === "peer-unavailable") {
+          try { p.destroy(); } catch (e) {}
+          if (peer === p) peer = null;
+          conn = null;
+          if (tries < 5) {
+            setTimeout(() => {
+              if (token === matchToken) attemptGuest(code, token, tries + 1);
+            }, 500 + tries * 350);
+          } else {
+            showMatchError("没有匹配到好友，请确认对方也输入了这组数字");
+          }
+        } else if (type === "unavailable-id") {
+          try { p.destroy(); } catch (e) {}
+          if (peer === p) peer = null;
+          if (tries < 3) {
+            setTimeout(() => {
+              if (token === matchToken) attemptGuest(code, token, tries + 1);
+            }, 300);
+          } else {
+            showMatchError("匹配失败，请重新试一次");
+          }
+        } else {
+          peerError(err);
+        }
+      });
     }
 
     // ---------- 玩家操作 ----------
@@ -542,19 +661,20 @@
 
     // ---------- 事件 ----------
     function backToMenu() {
-      try { peer && peer.destroy(); } catch (e) {}
-      peer = null; conn = null; connected = false;
+      matchToken += 1;
+      startScheduled = false;
+      closeMatchConnection();
       game = { started: false, round: 1, history: [], myLocked: false, peerLocked: false, myWord: "", peerWord: "", wordSent: false };
+      $("btn-retry").style.display = "none";
       hideOverlay($("win-overlay"));
       hideOverlay($("reveal-overlay"));
       show("screen-menu");
     }
-    $("btn-create").addEventListener("click", createRoom);
-    $("btn-join").addEventListener("click", joinRoom);
-    $("join-code").addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
+    $("btn-match").addEventListener("click", matchWithCode);
+    $("join-code").addEventListener("keydown", (e) => { if (e.key === "Enter") matchWithCode(); });
     $("btn-back").addEventListener("click", backToMenu);
     $("btn-leave").addEventListener("click", backToMenu);
-    $("btn-start").addEventListener("click", () => { send({ type: "start" }); startGame(); try { $("word-input").focus(); } catch (e) {} });
+    $("btn-retry").addEventListener("click", retryMatch);
     $("btn-lock").addEventListener("click", tryLock);
     $("word-input").addEventListener("keydown", (e) => { if (e.key === "Enter") tryLock(); });
     $("btn-next").addEventListener("click", () => { hideOverlay($("reveal-overlay")); renderGame(); try { $("word-input").focus(); } catch (e) {} });
@@ -565,25 +685,6 @@
       startGame();
     });
     $("btn-again-close").addEventListener("click", () => { hideOverlay($("win-overlay")); renderGame(); });
-    $("btn-copy").addEventListener("click", () => {
-      const txt = roomCode || "";
-      const done = () => toast("已复制房间码：" + txt);
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(txt).then(done).catch(() => fallbackCopy(txt, done));
-      } else {
-        fallbackCopy(txt, done);
-      }
-    });
-    function fallbackCopy(txt, done) {
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = txt; ta.style.position = "fixed"; ta.style.opacity = "0";
-        document.body.appendChild(ta); ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-        done();
-      } catch (e) { toast("复制失败，请长按房间码手动复制"); }
-    }
 
     // PeerJS 未加载提示
     if (typeof Peer === "undefined") {
